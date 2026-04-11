@@ -308,7 +308,7 @@ if st.session_state.hasil:
         st_folium(buat_peta(hasil), use_container_width=True, height=500)
         
     # CSV Download
-    all_rows = [] 
+    all_rows = []
     b = hasil["branch"]
     for p in hasil["route"]:
         all_rows.append({"Cabang": b["nama"], "Urutan": p["urutan"], "Penerima": p.get("Penerima",""), "Alamat": p.get("Alamat",""), "Jarak Sebelum": p["jarak_sebelumnya"], "Est Jalan": p["jarak_estimasi"], "Lat": p["lat"], "Lng": p["lng"], "Akurasi": p.get("akurasi","-")})
