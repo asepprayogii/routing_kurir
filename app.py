@@ -309,7 +309,7 @@ if st.session_state.hasil:
         
     # CSV Download
     all_rows = []  
-    b = hasil["branch"]
+    b = hasil["branch"] 
     for p in hasil["route"]:
         all_rows.append({"Cabang": b["nama"], "Urutan": p["urutan"], "Penerima": p.get("Penerima",""), "Alamat": p.get("Alamat",""), "Jarak Sebelum": p["jarak_sebelumnya"], "Est Jalan": p["jarak_estimasi"], "Lat": p["lat"], "Lng": p["lng"], "Akurasi": p.get("akurasi","-")})
     csv = pd.DataFrame(all_rows).to_csv(index=False).encode("utf-8")
