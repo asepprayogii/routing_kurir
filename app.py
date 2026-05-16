@@ -1,11 +1,11 @@
 """
-Kurir Toko — Route Optimizer
-============================
-Fitur:
-- Optimasi rute pengiriman berdasarkan lokasi
-- Estimasi jarak dan waktu tempuh
-- Export hasil ke CSV
-- Input koordinat manual jika diperlukan
+Kurir Toko — Route Optimizer v14
+=================================
+Perubahan dari versi sebelumnya:
+1. Algoritma CLUSTER — paket dikelompokkan per area geografis dulu,
+   baru diantar per zona (tidak loncat-loncat area)
+2. RETURN-TO-BASE — rute terakhir mempertimbangkan jarak pulang ke gudang
+3. Semua fitur v12 tetap ada (geocoding, manual coords, ORS/OSRM routing)
 """
 
 import math
@@ -21,7 +21,7 @@ from geopy.geocoders import Nominatim
 from geopy.exc import GeocoderTimedOut, GeocoderServiceError
 
 # ──────────────────────────────────────────────────────
-# KONFIGURASI INTERNAL (Tidak ditampilkan di UI)
+# KONFIGURASI INTERNAL
 # ──────────────────────────────────────────────────────
 
 _ORS_API_KEY = "eyJvcmciOiI1YjNjZTM1OTc4NTExMTAwMDFjZjYyNDgiLCJpZCI6ImRjYTUxM2YwYWU1NzQwMDViNTU4M2VmZDA4NWRlNzFjIiwiaCI6Im11cm11cjY0In0="
@@ -92,7 +92,7 @@ _REGION_FALLBACK = {
 }
 
 # ──────────────────────────────────────────────────────
-# ROUTING ENGINES (Internal)
+# ROUTING ENGINES
 # ──────────────────────────────────────────────────────
 
 @st.cache_data(show_spinner=False, ttl=3600)
@@ -184,7 +184,7 @@ def _get_matrix_with_fallback(coords: tuple) -> tuple:
     return _osrm_table(coords)
 
 # ──────────────────────────────────────────────────────
-# GEOCODING (Internal)
+# GEOCODING
 # ──────────────────────────────────────────────────────
 
 def _extract_coords_from_text(text: str):
@@ -247,10 +247,10 @@ def _photon(query: str):
 
 def _region_fallback(raw: str):
     text = raw.lower()
-    specific_areas = ["rungkut industri", "rungkut", "tandes lor", "tandes", "wonokromo", "raden wijaya", 
-                      "mulyorejo", "manyar kertoarjo", "manyar kertoadjo", "sambikerep", "citraland", 
-                      "citraland cbd", "gubeng kertajaya", "gubeng", "gayungan", "tegalsari", "genteng", 
-                      "benowo", "wiyung asri", "wiyung", "jemursari", "ngagel jaya", "ngagel", "diponegoro", 
+    specific_areas = ["rungkut industri", "rungkut", "tandes lor", "tandes", "wonokromo", "raden wijaya",
+                      "mulyorejo", "manyar kertoarjo", "manyar kertoadjo", "sambikerep", "citraland",
+                      "citraland cbd", "gubeng kertajaya", "gubeng", "gayungan", "tegalsari", "genteng",
+                      "benowo", "wiyung asri", "wiyung", "jemursari", "ngagel jaya", "ngagel", "diponegoro",
                       "ahmad yani", "darmo permai", "darmo", "hr muhammad"]
     for area in specific_areas:
         if area in text and area in _REGION_FALLBACK:
@@ -408,14 +408,324 @@ def _load_orders_excel(uploaded_file):
         return None, f"Gagal membaca file: {e}"
 
 # ──────────────────────────────────────────────────────
-# ROUTING OPTIMIZATION
+# CLUSTER ALGORITHM (NEW v14)
 # ──────────────────────────────────────────────────────
 
-def _nn_tsp_with_duration(start_lat, start_lng, pkgs: list) -> tuple:
+def _cluster_packages(pkgs: list, n_clusters: int = None) -> list:
+    """
+    Kelompokkan paket berdasarkan area geografis menggunakan K-Means sederhana.
+    
+    Logika:
+    - Hitung n_clusters otomatis berdasarkan jumlah paket
+    - Inisialisasi cluster centers menggunakan k-means++ style
+    - Iterasi sampai konvergen
+    - Kembalikan list of lists (setiap list = satu cluster/zona)
+    """
+    if len(pkgs) <= 3:
+        return [pkgs]
+    
+    # Tentukan jumlah cluster
+    if n_clusters is None:
+        n = len(pkgs)
+        if n <= 5:
+            n_clusters = 2
+        elif n <= 10:
+            n_clusters = 3
+        elif n <= 20:
+            n_clusters = 4
+        elif n <= 35:
+            n_clusters = 5
+        else:
+            n_clusters = max(5, n // 7)
+    
+    n_clusters = min(n_clusters, len(pkgs))
+    
+    # Ambil koordinat semua paket
+    coords = [(p["lat"], p["lng"]) for p in pkgs]
+    
+    # Inisialisasi center: pilih paket yang paling berjauhan (k-means++ style)
+    centers = [coords[0]]
+    for _ in range(n_clusters - 1):
+        max_min_dist = -1
+        best_coord = None
+        for c in coords:
+            min_dist = min(_haversine(c[0], c[1], ce[0], ce[1]) for ce in centers)
+            if min_dist > max_min_dist:
+                max_min_dist = min_dist
+                best_coord = c
+        if best_coord:
+            centers.append(best_coord)
+    
+    # Iterasi K-Means (max 20 iterasi)
+    for _ in range(20):
+        # Assign setiap paket ke cluster terdekat
+        assignments = []
+        for c in coords:
+            dists = [_haversine(c[0], c[1], ce[0], ce[1]) for ce in centers]
+            assignments.append(dists.index(min(dists)))
+        
+        # Update centers
+        new_centers = []
+        for ci in range(n_clusters):
+            cluster_coords = [coords[i] for i, a in enumerate(assignments) if a == ci]
+            if cluster_coords:
+                avg_lat = sum(c[0] for c in cluster_coords) / len(cluster_coords)
+                avg_lng = sum(c[1] for c in cluster_coords) / len(cluster_coords)
+                new_centers.append((avg_lat, avg_lng))
+            else:
+                new_centers.append(centers[ci])
+        
+        if new_centers == centers:
+            break
+        centers = new_centers
+    
+    # Buat list cluster
+    clusters = [[] for _ in range(n_clusters)]
+    for i, pkg in enumerate(pkgs):
+        clusters[assignments[i]].append(pkg)
+    
+    # Hapus cluster kosong
+    clusters = [c for c in clusters if c]
+    return clusters
+
+def _order_clusters_from_warehouse(start_lat: float, start_lng: float, clusters: list) -> list:
+    """
+    Urutkan cluster dari yang paling dekat ke gudang.
+    Hitung centroid setiap cluster, lalu urutkan berdasarkan jarak ke gudang.
+    """
+    def centroid(cluster):
+        lat = sum(p["lat"] for p in cluster) / len(cluster)
+        lng = sum(p["lng"] for p in cluster) / len(cluster)
+        return lat, lng
+    
+    # Urutkan cluster: mulai dari yang paling dekat ke gudang
+    remaining = list(range(len(clusters)))
+    ordered = []
+    current_lat, current_lng = start_lat, start_lng
+    
+    while remaining:
+        best_i = None
+        best_d = float("inf")
+        for i in remaining:
+            clat, clng = centroid(clusters[i])
+            d = _haversine(current_lat, current_lng, clat, clng)
+            if d < best_d:
+                best_d = d
+                best_i = i
+        ordered.append(clusters[best_i])
+        clat, clng = centroid(clusters[best_i])
+        current_lat, current_lng = clat, clng
+        remaining.remove(best_i)
+    
+    return ordered
+
+def _nn_within_cluster_return_aware(start_lat, start_lng, pkgs: list, home_lat: float, home_lng: float, is_last_cluster: bool, dist_matrix=None, dur_matrix=None, all_coords=None) -> tuple:
+    """
+    Nearest Neighbor di dalam satu cluster.
+    Jika ini cluster terakhir (is_last_cluster=True), pertimbangkan juga jarak pulang ke gudang
+    saat memilih paket terakhir yang diantar.
+    """
     if not pkgs:
-        return [], 0, 0
+        return [], 0, 0, 0
+    
+    remaining = pkgs.copy()
+    route = []
+    total_km = 0.0
+    total_sec = 0.0
+    clat, clng = start_lat, start_lng
+    
+    while remaining:
+        is_last_pkg = (len(remaining) == 1)
+        
+        if is_last_cluster and len(remaining) <= 3 and len(remaining) > 1:
+            # Untuk cluster terakhir dengan sedikit paket tersisa:
+            # Pilih urutan yang meminimalkan (jarak ke paket + jarak paket ke gudang)
+            best_cost = float("inf")
+            best_i = 0
+            for i, p in enumerate(remaining):
+                # Jarak dari posisi sekarang ke paket ini
+                if dist_matrix and all_coords:
+                    cur_idx = all_coords.index((clat, clng)) if (clat, clng) in all_coords else -1
+                    pkg_idx = all_coords.index((p["lat"], p["lng"])) if (p["lat"], p["lng"]) in all_coords else -1
+                    d_to_pkg = dist_matrix[cur_idx][pkg_idx] if cur_idx >= 0 and pkg_idx >= 0 else _haversine(clat, clng, p["lat"], p["lng"]) * 1.3
+                else:
+                    d_to_pkg = _haversine(clat, clng, p["lat"], p["lng"]) * 1.3
+                
+                # Jarak dari paket ini ke gudang
+                d_to_home = _haversine(p["lat"], p["lng"], home_lat, home_lng) * 1.3
+                
+                # Cost: jarak ke paket + bobot jarak pulang (lebih tinggi untuk paket terakhir)
+                remaining_after = len(remaining) - 1
+                home_weight = 0.5 if remaining_after > 0 else 1.5
+                cost = d_to_pkg + (home_weight * d_to_home)
+                
+                if cost < best_cost:
+                    best_cost = cost
+                    best_i = i
+        else:
+            # Normal nearest neighbor
+            best_i = 0
+            best_d = float("inf")
+            for i, p in enumerate(remaining):
+                d = _haversine(clat, clng, p["lat"], p["lng"])
+                if d < best_d:
+                    best_d = d
+                    best_i = i
+        
+        chosen = remaining.pop(best_i)
+        d_km = _haversine(clat, clng, chosen["lat"], chosen["lng"]) * 1.3
+        d_sec = d_km * 120
+        
+        chosen = chosen.copy()
+        chosen["jarak_lurus_km"] = round(_haversine(clat, clng, chosen["lat"], chosen["lng"]), 2)
+        chosen["jarak_jalan_km"] = round(d_km, 2)
+        chosen["durasi_detik"] = d_sec
+        chosen["durasi_menit"] = round(d_sec / 60, 1)
+        chosen["durasi_text"] = _format_duration(d_sec)
+        
+        route.append(chosen)
+        total_km += d_km
+        total_sec += d_sec
+        clat, clng = chosen["lat"], chosen["lng"]
+    
+    return route, round(total_km, 2), round(total_sec / 60, 1), total_sec
+
+def _cluster_tsp_with_duration(start_lat: float, start_lng: float, pkgs: list, n_clusters: int = None) -> tuple:
+    """
+    Algoritma utama v14: Cluster + Nearest Neighbor + Return-to-Base awareness.
+    
+    Langkah:
+    1. Cluster paket ke zona geografis
+    2. Urutkan zona dari yang terdekat ke gudang
+    3. Di dalam setiap zona, gunakan NN
+    4. Di zona terakhir, pertimbangkan jarak pulang ke gudang
+    """
+    if not pkgs:
+        return [], 0, 0, 0
+    
+    if len(pkgs) <= 4:
+        # Untuk paket sedikit, langsung pakai NN biasa dengan return awareness
+        return _nn_tsp_with_duration_v14(start_lat, start_lng, pkgs, start_lat, start_lng)
+    
+    # Step 1: Cluster
+    clusters = _cluster_packages(pkgs, n_clusters)
+    
+    # Step 2: Urutkan cluster dari gudang
+    ordered_clusters = _order_clusters_from_warehouse(start_lat, start_lng, clusters)
+    
+    # Step 3: Coba ambil matrix jarak untuk semua paket sekaligus
+    all_coords_raw = [(start_lat, start_lng)] + [(p["lat"], p["lng"]) for p in pkgs]
+    dist_matrix, dur_matrix = _get_matrix_with_fallback(tuple(all_coords_raw))
+    
+    # Step 4: Antar per cluster
+    full_route = []
+    total_km = 0.0
+    total_sec = 0.0
+    clat, clng = start_lat, start_lng
+    n_clusters_actual = len(ordered_clusters)
+    
+    for cluster_idx, cluster in enumerate(ordered_clusters):
+        is_last = (cluster_idx == n_clusters_actual - 1)
+        
+        if dist_matrix and dur_matrix:
+            # Gunakan matrix untuk NN dalam cluster
+            route_seg, km_seg, min_seg, sec_seg = _nn_within_cluster_with_matrix(
+                clat, clng, cluster, start_lat, start_lng, is_last,
+                dist_matrix, dur_matrix, all_coords_raw
+            )
+        else:
+            # Fallback haversine
+            route_seg, km_seg, min_seg, sec_seg = _nn_within_cluster_return_aware(
+                clat, clng, cluster, start_lat, start_lng, is_last
+            )
+        
+        full_route.extend(route_seg)
+        total_km += km_seg
+        total_sec += sec_seg
+        
+        if route_seg:
+            clat, clng = route_seg[-1]["lat"], route_seg[-1]["lng"]
+    
+    return full_route, round(total_km, 2), round(total_sec / 60, 1), total_sec
+
+def _nn_within_cluster_with_matrix(start_lat, start_lng, pkgs, home_lat, home_lng, is_last_cluster, dist_matrix, dur_matrix, all_coords_raw):
+    """
+    Nearest Neighbor dengan distance matrix untuk satu cluster.
+    Menggunakan indeks dari all_coords_raw untuk lookup matrix.
+    """
+    if not pkgs:
+        return [], 0, 0, 0
+    
+    # Buat mapping koordinat ke index di matrix
+    coord_to_idx = {c: i for i, c in enumerate(all_coords_raw)}
+    
+    remaining = pkgs.copy()
+    route = []
+    total_km = 0.0
+    total_sec = 0.0
+    clat, clng = start_lat, start_lng
+    
+    while remaining:
+        cur_coord = (clat, clng)
+        cur_idx = coord_to_idx.get(cur_coord, -1)
+        
+        # Kalau koordinat sekarang tidak ada di matrix (misalnya di tengah cluster),
+        # fallback ke haversine
+        if cur_idx < 0:
+            cur_idx = None
+        
+        best_i = 0
+        best_cost = float("inf")
+        
+        for i, p in enumerate(remaining):
+            pkg_coord = (p["lat"], p["lng"])
+            pkg_idx = coord_to_idx.get(pkg_coord, -1)
+            
+            if cur_idx is not None and pkg_idx >= 0:
+                d_km = dist_matrix[cur_idx][pkg_idx]
+                d_sec = dur_matrix[cur_idx][pkg_idx]
+            else:
+                d_km = _haversine(clat, clng, p["lat"], p["lng"]) * 1.3
+                d_sec = d_km * 120
+            
+            # Untuk cluster terakhir dengan sedikit paket:
+            # tambahkan bobot jarak pulang ke gudang
+            if is_last_cluster and len(remaining) <= 3:
+                home_d = _haversine(p["lat"], p["lng"], home_lat, home_lng) * 1.3
+                remaining_after = len(remaining) - 1
+                home_weight = 0.4 if remaining_after > 0 else 1.2
+                cost = d_km + home_weight * home_d
+            else:
+                cost = d_km
+            
+            if cost < best_cost:
+                best_cost = cost
+                best_i = i
+                best_d_km = d_km
+                best_d_sec = d_sec
+        
+        chosen = remaining.pop(best_i).copy()
+        chosen["jarak_lurus_km"] = round(_haversine(clat, clng, chosen["lat"], chosen["lng"]), 2)
+        chosen["jarak_jalan_km"] = round(best_d_km, 2)
+        chosen["durasi_detik"] = best_d_sec
+        chosen["durasi_menit"] = round(best_d_sec / 60, 1)
+        chosen["durasi_text"] = _format_duration(best_d_sec)
+        
+        route.append(chosen)
+        total_km += best_d_km
+        total_sec += best_d_sec
+        clat, clng = chosen["lat"], chosen["lng"]
+    
+    return route, round(total_km, 2), round(total_sec / 60, 1), total_sec
+
+def _nn_tsp_with_duration_v14(start_lat, start_lng, pkgs, home_lat, home_lng):
+    """NN biasa dengan return awareness (untuk paket <= 4)."""
+    if not pkgs:
+        return [], 0, 0, 0
+    
     all_coords = [(start_lat, start_lng)] + [(p["lat"], p["lng"]) for p in pkgs]
     dist_matrix, dur_matrix = _get_matrix_with_fallback(tuple(all_coords))
+    
     if dist_matrix and dur_matrix:
         remaining_idx = list(range(1, len(pkgs) + 1))
         route, total_km, total_sec, current_idx = [], 0.0, 0.0, 0
@@ -424,75 +734,133 @@ def _nn_tsp_with_duration(start_lat, start_lng, pkgs: list) -> tuple:
             for mi in remaining_idx:
                 d = dist_matrix[current_idx][mi]
                 t = dur_matrix[current_idx][mi]
-                if d < best_d:
-                    best_d, best_t, best_i, best_mi = d, t, remaining_idx.index(mi), mi
+                
+                # Return awareness: jika tinggal 1-2 paket, pertimbangkan jarak pulang
+                if len(remaining_idx) <= 2:
+                    home_d = _haversine(all_coords[mi][0], all_coords[mi][1], home_lat, home_lng) * 1.3
+                    is_last = (len(remaining_idx) == 1)
+                    home_w = 1.2 if is_last else 0.4
+                    cost = d + home_w * home_d
+                else:
+                    cost = d
+                
+                if cost < best_d:
+                    best_d, best_t, best_i, best_mi = cost, t, remaining_idx.index(mi), mi
+            
             chosen = pkgs[best_mi - 1].copy()
+            actual_d = dist_matrix[current_idx][best_mi]
             chosen["jarak_lurus_km"] = round(_haversine(all_coords[current_idx][0], all_coords[current_idx][1], all_coords[best_mi][0], all_coords[best_mi][1]), 2)
-            chosen["jarak_jalan_km"] = round(best_d, 2)
+            chosen["jarak_jalan_km"] = round(actual_d, 2)
             chosen["durasi_detik"] = best_t
             chosen["durasi_menit"] = round(best_t / 60, 1)
             chosen["durasi_text"] = _format_duration(best_t)
             route.append(chosen)
-            total_km += best_d
+            total_km += actual_d
             total_sec += best_t
             current_idx = best_mi
             remaining_idx.pop(best_i)
         return route, round(total_km, 2), round(total_sec / 60, 1), total_sec
     else:
-        remaining, route, total_km, total_min, clat, clng = pkgs.copy(), [], 0.0, 0.0, start_lat, start_lng
+        # Fallback haversine
+        remaining, route, total_km, total_sec = pkgs.copy(), [], 0.0, 0.0
+        clat, clng = start_lat, start_lng
         while remaining:
             best_i, best_d = 0, float("inf")
             for i, p in enumerate(remaining):
                 d = _haversine(clat, clng, p["lat"], p["lng"])
-                if d < best_d:
-                    best_d, best_i = d, i
-            chosen = remaining.pop(best_i)
-            estimated_duration_sec = best_d * 120
-            chosen["jarak_lurus_km"] = round(best_d, 2)
-            chosen["jarak_jalan_km"] = round(max(best_d, 0.001) * 1.3, 2)
-            chosen["durasi_detik"] = estimated_duration_sec * 1.3
-            chosen["durasi_menit"] = round(estimated_duration_sec * 1.3 / 60, 1)
-            chosen["durasi_text"] = _format_duration(estimated_duration_sec * 1.3)
+                cost = d
+                if len(remaining) <= 2:
+                    home_d = _haversine(p["lat"], p["lng"], home_lat, home_lng)
+                    is_last = (len(remaining) == 1)
+                    cost = d + (1.2 if is_last else 0.4) * home_d
+                if cost < best_d:
+                    best_d, best_i = cost, i
+            chosen = remaining.pop(best_i).copy()
+            d_km = _haversine(clat, clng, chosen["lat"], chosen["lng"]) * 1.3
+            d_sec = d_km * 120
+            chosen["jarak_lurus_km"] = round(_haversine(clat, clng, chosen["lat"], chosen["lng"]), 2)
+            chosen["jarak_jalan_km"] = round(d_km, 2)
+            chosen["durasi_detik"] = d_sec
+            chosen["durasi_menit"] = round(d_sec / 60, 1)
+            chosen["durasi_text"] = _format_duration(d_sec)
             route.append(chosen)
-            total_km += max(best_d, 0.001) * 1.3
-            total_min += estimated_duration_sec * 1.3 / 60
+            total_km += d_km
+            total_sec += d_sec
             clat, clng = chosen["lat"], chosen["lng"]
-        return route, round(total_km, 2), round(total_min, 1), total_min * 60
+        return route, round(total_km, 2), round(total_sec / 60, 1), total_sec
 
 # ──────────────────────────────────────────────────────
 # MAP VISUALIZATION
 # ──────────────────────────────────────────────────────
 
-_SEGMENT_PALETTE = ["#E6194B", "#3CB44B", "#4363D8", "#F58231", "#911EB4", "#42D4F4", "#F032E6", "#BFEF45", 
-                   "#FABED4", "#469990", "#DCBEFF", "#9A6324", "#FFFAC8", "#800000", "#AAFFC3", "#808000", 
+_SEGMENT_PALETTE = ["#E6194B", "#3CB44B", "#4363D8", "#F58231", "#911EB4", "#42D4F4", "#F032E6", "#BFEF45",
+                   "#FABED4", "#469990", "#DCBEFF", "#9A6324", "#FFFAC8", "#800000", "#AAFFC3", "#808000",
                    "#FFD8B1", "#000075", "#A9A9A9", "#E6BEFF"]
 
 def _get_segment_color(idx: int) -> str:
     return _SEGMENT_PALETTE[idx % len(_SEGMENT_PALETTE)]
 
-def _buat_peta(cabang: dict, route: list) -> folium.Map:
-    m = folium.Map(location=[cabang["lat"], cabang["lng"]], zoom_start=10, tiles="CartoDB Positron")
-    folium.Marker([cabang["lat"], cabang["lng"]], tooltip=f"Gudang {cabang['nama']}", 
-                  icon=folium.Icon(color=_FOLIUM_COLORS.get(cabang["kode"], "gray"), icon="home", prefix="fa")).add_to(m)
+def _buat_peta(cabang: dict, route: list, rute_pulang_geometry: list = None) -> folium.Map:
+    m = folium.Map(location=[cabang["lat"], cabang["lng"]], zoom_start=13, tiles="CartoDB Positron")
+    folium.Marker(
+        [cabang["lat"], cabang["lng"]],
+        tooltip=f"Gudang {cabang['nama']}",
+        icon=folium.Icon(color=_FOLIUM_COLORS.get(cabang["kode"], "gray"), icon="home", prefix="fa")
+    ).add_to(m)
+    
     if not route:
         return m
+    
     all_points = [(cabang["lat"], cabang["lng"])] + [(p["lat"], p["lng"]) for p in route]
+    
     for i in range(len(all_points) - 1):
         seg = _get_route_with_fallback((all_points[i], all_points[i + 1]))
         color = _get_segment_color(i)
         if seg and seg.get("geometry"):
             coords = seg["geometry"]
-            tooltip = f"#{i + 1} -> #{i + 2} ({seg['distance_km']} km, {_format_duration(seg['duration_seconds'])})"
+            tooltip = f"#{i + 1} → #{i + 2} ({seg['distance_km']} km, {_format_duration(seg['duration_seconds'])})"
         else:
             coords = [list(all_points[i]), list(all_points[i + 1])]
-            tooltip = f"#{i + 1} -> #{i + 2} (Estimasi)"
+            tooltip = f"#{i + 1} → #{i + 2} (Estimasi)"
         folium.PolyLine(coords, color=color, weight=5 if seg else 3, opacity=0.85, tooltip=tooltip).add_to(m)
+    
+    # Garis pulang ke gudang — pakai geometry yang sudah dihitung via ORS/OSRM
+    if route:
+        last = route[-1]
+        if rute_pulang_geometry and len(rute_pulang_geometry) > 1:
+            coords_return = rute_pulang_geometry
+            label_pulang = "Rute pulang ke gudang (jalan nyata)"
+        else:
+            coords_return = [[last["lat"], last["lng"]], [cabang["lat"], cabang["lng"]]]
+            label_pulang = "Rute pulang ke gudang (estimasi)"
+        folium.PolyLine(
+            coords_return,
+            color="#555555",
+            weight=4,
+            opacity=0.6,
+            dash_array="8 4",
+            tooltip=label_pulang
+        ).add_to(m)
+        # Marker tanda panah pulang di titik terakhir
+        folium.Marker(
+            [cabang["lat"], cabang["lng"]],
+            tooltip=f"Gudang {cabang['nama']} (tujuan pulang)",
+            icon=folium.Icon(color=_FOLIUM_COLORS.get(cabang["kode"], "gray"), icon="home", prefix="fa")
+        ).add_to(m)
+    
     for i, pkg in enumerate(route, 1):
         color = _get_segment_color(i - 1)
-        tip = f"<b>#{i} - {pkg.get('Invoice NO', '-')}</b><br>{pkg.get('Recipient Name', '-')}<br>{str(pkg.get('Items Name', '-'))[:40]}<br>Jarak: {pkg['jarak_jalan_km']} km<br>Waktu: {pkg.get('durasi_text', '-')}"
+        tip = (f"<b>#{i} - {pkg.get('Invoice NO', '-')}</b><br>"
+               f"{pkg.get('Recipient Name', '-')}<br>"
+               f"{str(pkg.get('Items Name', '-'))[:40]}<br>"
+               f"Jarak: {pkg['jarak_jalan_km']} km<br>"
+               f"Waktu: {pkg.get('durasi_text', '-')}")
         folium.CircleMarker([pkg["lat"], pkg["lng"]], radius=8, color=color, fill=True, fill_color=color, tooltip=tip).add_to(m)
-        folium.Marker([pkg["lat"], pkg["lng"]], 
-                      icon=folium.DivIcon(html=f'<div style="color:white;background:{color};border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:bold;border:2px solid white">{i}</div>')).add_to(m)
+        folium.Marker(
+            [pkg["lat"], pkg["lng"]],
+            icon=folium.DivIcon(html=f'<div style="color:white;background:{color};border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:bold;border:2px solid white">{i}</div>')
+        ).add_to(m)
+    
     return m
 
 # ──────────────────────────────────────────────────────
@@ -500,8 +868,17 @@ def _buat_peta(cabang: dict, route: list) -> folium.Map:
 # ──────────────────────────────────────────────────────
 
 def _init_state():
-    defs = {"branches": [b.copy() for b in _BRANCHES_DEFAULT], "selected_branch_kode": _BRANCHES_DEFAULT[0]["kode"],
-            "hasil": None, "orders_df": None, "pkg_df": None, "_last_geocoded": [], "filter_kt": True, "manual_coords": {}}
+    defs = {
+        "branches": [b.copy() for b in _BRANCHES_DEFAULT],
+        "selected_branch_kode": _BRANCHES_DEFAULT[0]["kode"],
+        "hasil": None,
+        "orders_df": None,
+        "pkg_df": None,
+        "_last_geocoded": [],
+        "filter_kt": True,
+        "manual_coords": {},
+        "algo_mode": "cluster",
+    }
     for k, v in defs.items():
         if k not in st.session_state:
             st.session_state[k] = v
@@ -513,6 +890,7 @@ thead tr th { background-color:#f1f3f5!important; font-weight:600!important; fon
 .stButton > button[kind="primary"] { background-color:#1a3a5c; border-color:#1a3a5c; font-weight:600; }
 .section-header { font-size:12px; font-weight:700; color:#6c757d; text-transform:uppercase; letter-spacing:1px; margin-bottom:8px; }
 .info-card { background:#f8f9fa; border-left:4px solid #1a3a5c; padding:10px 16px; border-radius:0 6px 6px 0; margin-bottom:10px; font-size:13px; }
+.cluster-badge { display:inline-block; padding:2px 8px; border-radius:12px; font-size:11px; font-weight:600; margin-right:4px; }
 </style>"""
 
 # ──────────────────────────────────────────────────────
@@ -526,31 +904,55 @@ _init_state()
 # Sidebar
 with st.sidebar:
     st.markdown("## Kurir Toko")
-    st.caption("Route Optimizer")
+    st.caption("Route Optimizer v14")
     st.divider()
-    
+
     branches = st.session_state.branches
     branch_options = {b["kode"]: f"{b['nama']} ({b['kode']})" for b in branches}
-    selected_kode = st.radio("Cabang", list(branch_options.keys()), 
-                             format_func=lambda k: branch_options[k], 
-                             index=list(branch_options.keys()).index(st.session_state.selected_branch_kode), 
-                             label_visibility="collapsed")
+    selected_kode = st.radio(
+        "Cabang", list(branch_options.keys()),
+        format_func=lambda k: branch_options[k],
+        index=list(branch_options.keys()).index(st.session_state.selected_branch_kode),
+        label_visibility="collapsed"
+    )
     if selected_kode != st.session_state.selected_branch_kode:
         st.session_state.selected_branch_kode = selected_kode
         st.session_state.hasil = None
         st.rerun()
-    
+
     cabang_aktif = next(b for b in branches if b["kode"] == selected_kode)
-    st.markdown(f'<div style="background:#f8f9fa;border-left:4px solid {_BRANCH_COLORS.get(cabang_aktif["kode"], "#555")};padding:10px;border-radius:4px;margin:8px 0"><strong>{cabang_aktif["nama"]}</strong><br><span style="font-size:12px;color:#666">Lat: {cabang_aktif["lat"]:.6f} | Lng: {cabang_aktif["lng"]:.6f}</span></div>', unsafe_allow_html=True)
+    st.markdown(
+        f'<div style="background:#f8f9fa;border-left:4px solid {_BRANCH_COLORS.get(cabang_aktif["kode"], "#555")};'
+        f'padding:10px;border-radius:4px;margin:8px 0"><strong>{cabang_aktif["nama"]}</strong><br>'
+        f'<span style="font-size:12px;color:#666">Lat: {cabang_aktif["lat"]:.6f} | Lng: {cabang_aktif["lng"]:.6f}</span></div>',
+        unsafe_allow_html=True
+    )
     st.divider()
+
+    st.markdown("**Algoritma Rute**")
+    algo_mode = st.radio(
+        "Pilih algoritma",
+        ["cluster", "nn_only"],
+        format_func=lambda x: "🗺️ Cluster + NN (Direkomendasikan)" if x == "cluster" else "📍 Nearest Neighbor saja",
+        index=0 if st.session_state.algo_mode == "cluster" else 1,
+        label_visibility="collapsed"
+    )
+    st.session_state.algo_mode = algo_mode
+
+    if algo_mode == "cluster":
+        st.caption("Paket dikelompokkan per area, lalu diantar per zona. Lebih sedikit bolak-balik.")
+    else:
+        st.caption("Selalu pilih paket terdekat dari posisi sekarang.")
     
+    st.divider()
+
     if st.button("Reset", use_container_width=True):
         st.session_state.clear()
         st.rerun()
 
 # Header
 st.title("Kurir Toko - Route Optimizer")
-st.caption("Optimasi rute pengiriman dengan estimasi jarak dan waktu")
+st.caption("v14 · Cluster + Return-to-Base Optimization")
 st.divider()
 
 # 1. UPLOAD FILE
@@ -569,15 +971,15 @@ if uploaded:
         m1.metric("Total Order", len(df_orders))
         m2.metric("Kurir Toko", int(n_kt))
         m3.metric("Total Nilai", _format_currency(df_orders["Total Amount"].sum()))
-        
+
         st.session_state.filter_kt = st.toggle("Filter hanya Kurir Toko", value=st.session_state.filter_kt)
         df_view = df_orders[df_orders["Shipping Courier"].apply(_is_kurir_toko)] if st.session_state.filter_kt else df_orders
-        
+
         if df_view.empty:
             st.warning("Tidak ada order Kurir Toko.")
         else:
             st.markdown(f"#### Preview ({len(df_view)} baris)")
-            cols_show = {"Invoice NO": "Invoice", "Order Date": "Tgl", "Recipient Name": "Penerima", 
+            cols_show = {"Invoice NO": "Invoice", "Order Date": "Tgl", "Recipient Name": "Penerima",
                          "Items Name": "Barang", "Total Amount": "Total", "Shipping Address": "Alamat"}
             avail = [c for c in cols_show if c in df_view.columns]
             df_disp = df_view[avail].copy()
@@ -585,7 +987,7 @@ if uploaded:
             if "Tgl" in df_disp.columns:
                 df_disp["Tgl"] = df_disp["Tgl"].apply(_format_date)
             st.dataframe(df_disp, use_container_width=True, height=250, hide_index=True)
-            
+
             if st.button(f"Gunakan {len(df_view)} Order Ini", type="primary", use_container_width=True):
                 st.session_state.pkg_df = df_view.reset_index(drop=True)
                 st.session_state.hasil = None
@@ -596,9 +998,9 @@ if uploaded:
 if st.session_state.pkg_df is not None and not st.session_state.pkg_df.empty:
     st.divider()
     st.subheader("Koreksi Koordinat (Opsional)")
-    
+
     pkg_df = st.session_state.pkg_df
-    
+
     if st.session_state._last_geocoded:
         col1, col2 = st.columns([3, 1])
         with col2:
@@ -607,120 +1009,166 @@ if st.session_state.pkg_df is not None and not st.session_state.pkg_df.empty:
                     idx = item.get("_original_idx")
                     if idx is not None and item.get("lat"):
                         st.session_state.manual_coords[idx] = {"lat": item["lat"], "lng": item["lng"]}
-                st.success(f"Koordinat telah diisi otomatis")
+                st.success("Koordinat telah diisi otomatis")
                 st.rerun()
-    
+
     with st.expander("Panel Input Manual", expanded=False):
         for i, row in pkg_df.iterrows():
             inv = row.get("Invoice NO", f"#{i + 1}")
             addr = str(row.get("Shipping Address", ""))[:60]
-            
+
             geocoded_item = None
             if st.session_state._last_geocoded:
                 for item in st.session_state._last_geocoded:
                     if item.get("_original_idx") == i:
                         geocoded_item = item
                         break
-            
+
             col1, col2, col3, col4 = st.columns([2.5, 1.2, 1.2, 1])
-            
+
             with col1:
                 st.markdown(f"**{inv}**<br><span style='font-size:10px;color:#666'>{addr}</span>", unsafe_allow_html=True)
-            
+
             saved = st.session_state.manual_coords.get(i, {})
             default_lat = saved.get("lat", geocoded_item.get("lat", 0.0) if geocoded_item else 0.0)
             default_lng = saved.get("lng", geocoded_item.get("lng", 0.0) if geocoded_item else 0.0)
-            
+
             with col2:
-                nl = st.number_input("Latitude", value=float(default_lat), format="%.6f", 
+                nl = st.number_input("Latitude", value=float(default_lat), format="%.6f",
                                      key=f"mlat_{i}", label_visibility="collapsed")
             with col3:
-                ng = st.number_input("Longitude", value=float(default_lng), format="%.6f", 
+                ng = st.number_input("Longitude", value=float(default_lng), format="%.6f",
                                      key=f"mlng_{i}", label_visibility="collapsed")
             with col4:
                 if nl != 0.0 and ng != 0.0:
                     if st.button("Simpan", key=f"save_{i}"):
                         st.session_state.manual_coords[i] = {"lat": nl, "lng": ng}
-            
+
             if nl != 0.0 and ng != 0.0 and (saved.get("lat") != nl or saved.get("lng") != ng):
                 st.session_state.manual_coords[i] = {"lat": nl, "lng": ng}
 
 # 3. HITUNG RUTE
 st.divider()
 st.subheader("Hitung Rute Optimal")
-run = st.button("Hitung Rute", type="primary", use_container_width=True)
+
+algo_label = "Cluster + NN" if st.session_state.algo_mode == "cluster" else "Nearest Neighbor"
+run = st.button(f"Hitung Rute ({algo_label})", type="primary", use_container_width=True)
 
 if run:
     if st.session_state.pkg_df is None:
         st.error("Silakan upload dan pilih order terlebih dahulu.")
         st.stop()
-    
-    pkg_list = [{**p, "_idx": i, "_original_idx": i} for i, p in enumerate(st.session_state.pkg_df.to_dict("records")) 
-                if str(p.get("Shipping Address", "")).strip().lower() not in ("", "-", "nan")]
+
+    pkg_list = [
+        {**p, "_idx": i, "_original_idx": i}
+        for i, p in enumerate(st.session_state.pkg_df.to_dict("records"))
+        if str(p.get("Shipping Address", "")).strip().lower() not in ("", "-", "nan")
+    ]
     if not pkg_list:
         st.error("Tidak ada alamat valid untuk diproses.")
         st.stop()
-    
+
     bar = st.progress(0, text="Memproses alamat...")
     geocoded, failed = [], []
     api_key = _LOCATIONIQ_API_KEY
-    
+
     for i, pkg in enumerate(pkg_list):
         raw = str(pkg.get("Shipping Address", ""))
         bar.progress((i + 1) / len(pkg_list), text=f"[{i + 1}/{len(pkg_list)}] {raw[:40]}...")
         idx = pkg.get("_idx", i)
-        
+
         if idx in st.session_state.manual_coords and st.session_state.manual_coords[idx].get("lat", 0) != 0:
             lat = st.session_state.manual_coords[idx]["lat"]
             lng = st.session_state.manual_coords[idx]["lng"]
             src, akr = "Manual", "tinggi"
         else:
             lat, lng, src, akr = _geocode(raw, api_key=api_key)
-        
+
         if lat is None or lat == 0:
             failed.append({"Invoice NO": pkg.get("Invoice NO", "-"), "Alamat": raw})
         else:
             out = {k: v for k, v in pkg.items() if k not in ["_idx", "_original_idx"]}
             out["_original_idx"] = pkg.get("_original_idx", i)
             geocoded.append({**out, "lat": lat, "lng": lng, "geocode_sumber": src, "akurasi": akr})
-    
+
     bar.empty()
     st.session_state._last_geocoded = geocoded
-    
+
     if failed:
         with st.expander(f"Alamat yang tidak dapat diproses ({len(failed)})", expanded=False):
             for f in failed[:5]:
                 st.caption(f"- {f['Invoice NO']}: {f['Alamat'][:50]}...")
-    
+
     paket_ok = [p for p in geocoded if p.get("akurasi") != "gagal" and p.get("lat")]
     if not paket_ok:
         st.error("Semua alamat gagal diproses.")
         st.stop()
-    
-    methods = {}
-    for p in geocoded:
-        methods[p["geocode_sumber"]] = methods.get(p["geocode_sumber"], 0) + 1
+
     st.info(f"{len(geocoded)} alamat berhasil diproses")
-    
+
     val = _validate_geocoding_results(geocoded)
     if val["warning"]:
         st.warning(val["warning"])
-    
+
     b = cabang_aktif
-    st.info("Menghitung rute optimal...")
-    
-    route, total_km, total_min, total_sec = _nn_tsp_with_duration(b["lat"], b["lng"], paket_ok)
-    
-    st.success(f"Rute selesai: {len(route)} paket | {total_km:.1f} km | Estimasi waktu: {_format_duration(total_sec)}")
-    
+
+    if st.session_state.algo_mode == "cluster":
+        st.info("Menghitung rute cluster (zona per zona)...")
+        route, total_km, total_min, total_sec = _cluster_tsp_with_duration(
+            b["lat"], b["lng"], paket_ok
+        )
+        algo_used = "Cluster + NN + Return-to-Base"
+    else:
+        st.info("Menghitung rute nearest neighbor...")
+        route, total_km, total_min, total_sec = _nn_tsp_with_duration_v14(
+            b["lat"], b["lng"], paket_ok, b["lat"], b["lng"]
+        )
+        algo_used = "Nearest Neighbor + Return-to-Base"
+
+    # Hitung rute pulang ke gudang via ORS/OSRM (jalan nyata)
+    rute_pulang = {"distance_km": 0, "duration_seconds": 0, "geometry": []}
+    if route:
+        last_pkg = route[-1]
+        seg_pulang = _get_route_with_fallback(
+            ((last_pkg["lat"], last_pkg["lng"]), (b["lat"], b["lng"]))
+        )
+        if seg_pulang:
+            rute_pulang = seg_pulang
+        else:
+            # Fallback haversine jika API mati
+            d_hav = _haversine(last_pkg["lat"], last_pkg["lng"], b["lat"], b["lng"]) * 1.3
+            rute_pulang = {
+                "distance_km": round(d_hav, 2),
+                "duration_seconds": d_hav * 120,
+                "geometry": [[last_pkg["lat"], last_pkg["lng"]], [b["lat"], b["lng"]]]
+            }
+
+    d_pulang = rute_pulang["distance_km"]
+    sec_pulang = rute_pulang["duration_seconds"]
+    total_km_full = round(total_km + d_pulang, 2)
+    total_sec_full = total_sec + sec_pulang
+
+    st.success(
+        f"Rute selesai: {len(route)} paket · {total_km:.1f} km · "
+        f"Estimasi: {_format_duration(total_sec)} · "
+        f"Pulang ke gudang: {d_pulang:.1f} km ({_format_duration(sec_pulang)}) · "
+        f"Total: {total_km_full:.1f} km"
+    )
+
     st.session_state.hasil = {
-        "branch": b, 
-        "route": route, 
-        "total_km": total_km, 
+        "branch": b,
+        "route": route,
+        "total_km": total_km,
         "total_min": total_min,
         "total_sec": total_sec,
-        "total_paket": len(route), 
+        "total_paket": len(route),
         "total_nilai": sum(p.get("Total Amount", 0) for p in route),
+        "jarak_pulang_km": round(d_pulang, 2),
+        "durasi_pulang_sec": sec_pulang,
+        "total_km_full": total_km_full,
+        "total_sec_full": total_sec_full,
+        "rute_pulang_geometry": rute_pulang.get("geometry", []),
+        "algo_used": algo_used,
     }
 
 # 4. HASIL
@@ -728,31 +1176,37 @@ if st.session_state.hasil:
     hasil = st.session_state.hasil
     b = hasil["branch"]
     route = hasil["route"]
-    
+
     st.divider()
     st.subheader("Hasil Rute Pengiriman")
-    
-    col1, col2, col3, col4 = st.columns(4)
+    st.caption(f"Algoritma: {hasil.get('algo_used', '-')}")
+
+    col1, col2, col3, col4, col5 = st.columns(5)
     col1.metric("Paket", hasil["total_paket"])
-    col2.metric("Total Jarak", f"{hasil['total_km']:.1f} km")
-    col3.metric("Estimasi Waktu", _format_duration(hasil["total_sec"]))
-    col4.metric("Total Nilai", _format_currency(hasil["total_nilai"]))
-    
+    col2.metric("Jarak Antar", f"{hasil['total_km']:.1f} km")
+    col3.metric("Jarak Pulang", f"{hasil['jarak_pulang_km']:.1f} km")
+    col4.metric("Total Jarak", f"{hasil['total_km_full']:.1f} km")
+    col5.metric("Total Nilai", _format_currency(hasil["total_nilai"]))
+
     if hasil["total_paket"] > 0:
-        avg_time_per_pkg = hasil["total_sec"] / hasil["total_paket"]
-        st.caption(f"Rata-rata: {_format_duration(avg_time_per_pkg)} per paket")
-    
+        avg_time = hasil["total_sec"] / hasil["total_paket"]
+        st.caption(
+            f"Estimasi antar: {_format_duration(hasil['total_sec'])} · "
+            f"Pulang: {_format_duration(hasil['durasi_pulang_sec'])} · "
+            f"Total: {_format_duration(hasil['total_sec_full'])}"
+        )
+
     tab_rute, tab_peta = st.tabs(["Urutan Pengiriman", "Peta Rute"])
-    
+
     with tab_rute:
         rows = []
         cumulative_time = 0
         cumulative_km = 0
-        
+
         for i, pkg in enumerate(route, 1):
             cumulative_time += pkg.get("durasi_detik", 0)
             cumulative_km += pkg.get("jarak_jalan_km", 0)
-            
+
             rows.append({
                 "No": i,
                 "Invoice": pkg.get("Invoice NO", "-"),
@@ -763,10 +1217,34 @@ if st.session_state.hasil:
                 "Kumulatif Waktu": _format_duration(cumulative_time),
                 "Alamat": str(pkg.get("Shipping Address", "-"))[:50]
             })
-        
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True, height=450)
-        
-        csv_data = pd.DataFrame([{
+
+        # Tambahkan baris pulang ke gudang
+        if hasil["jarak_pulang_km"] > 0:
+            cumulative_time += hasil["durasi_pulang_sec"]
+            cumulative_km += hasil["jarak_pulang_km"]
+            rows.append({
+                "No": "🏠",
+                "Invoice": "— PULANG —",
+                "Penerima": f"Gudang {b['nama']}",
+                "Barang": "-",
+                "Jarak(km)": hasil["jarak_pulang_km"],
+                "Durasi": _format_duration(hasil["durasi_pulang_sec"]),
+                "Kumulatif Waktu": _format_duration(cumulative_time),
+                "Alamat": f"Lat: {b['lat']:.6f}, Lng: {b['lng']:.6f}"
+            })
+
+        df_rows = pd.DataFrame(rows)
+        st.dataframe(df_rows, use_container_width=True, hide_index=True, height=480)
+
+        st.info(
+            f"🏠 Pulang ke gudang {b['nama']}: "
+            f"{hasil['jarak_pulang_km']:.1f} km · "
+            f"{_format_duration(hasil['durasi_pulang_sec'])} · "
+            f"Total keseluruhan: {hasil['total_km_full']:.1f} km ({_format_duration(hasil['total_sec_full'])})"
+        )
+
+        # CSV export termasuk baris pulang
+        csv_rows = [{
             "No": i,
             "Invoice NO": pkg.get("Invoice NO", "-"),
             "Recipient Name": pkg.get("Recipient Name", "-"),
@@ -776,12 +1254,37 @@ if st.session_state.hasil:
             "Longitude": pkg["lng"],
             "Jarak_Jalan_km": pkg["jarak_jalan_km"],
             "Durasi_menit": pkg.get("durasi_menit", 0),
-            "Durasi_text": pkg.get("durasi_text", "-")
-        } for i, pkg in enumerate(route, 1)]).to_csv(index=False).encode("utf-8")
-        
-        st.download_button("Download Hasil (.csv)", csv_data, f"rute_{b['kode']}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv")
-    
+            "Durasi_text": pkg.get("durasi_text", "-"),
+            "Keterangan": "Pengiriman"
+        } for i, pkg in enumerate(route, 1)]
+
+        # Tambah baris pulang di CSV
+        csv_rows.append({
+            "No": "PULANG",
+            "Invoice NO": "-",
+            "Recipient Name": f"Gudang {b['nama']}",
+            "Items Name": "-",
+            "Total Amount": 0,
+            "Latitude": b["lat"],
+            "Longitude": b["lng"],
+            "Jarak_Jalan_km": hasil["jarak_pulang_km"],
+            "Durasi_menit": round(hasil["durasi_pulang_sec"] / 60, 1),
+            "Durasi_text": _format_duration(hasil["durasi_pulang_sec"]),
+            "Keterangan": "Pulang ke Gudang"
+        })
+
+        csv_data = pd.DataFrame(csv_rows).to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            "Download Hasil (.csv)",
+            csv_data,
+            f"rute_{b['kode']}_{pd.Timestamp.now().strftime('%Y%m%d_%H%M')}.csv"
+        )
+
     with tab_peta:
-        st.caption("Garis menunjukkan rute jalan. Angka menunjukkan urutan pengiriman.")
+        st.caption("Garis solid = rute antar · Garis putus-putus abu = rute pulang ke gudang · Angka = urutan pengiriman")
         with st.spinner("Memuat peta..."):
-            st_folium(_buat_peta(b, route), use_container_width=True, height=600)
+            st_folium(
+                _buat_peta(b, route, hasil.get("rute_pulang_geometry", [])),
+                use_container_width=True, height=600
+            )
