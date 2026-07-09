@@ -1,8 +1,8 @@
 """
-Kurir Toko — Route Optimizer v18
-=================================
+Kurir Toko — Route Optimizer v18 (Updated with Manual Input)
+============================================================
 Multi-Vehicle Routing: Motor vs Mobil
-Fitur: GraphHopper API + Segment Colors + Fallback Cerdas
+Fitur: GraphHopper API + Segment Colors + Fallback Cerdas + Input Manual
 
 LOGIKA KLASIFIKASI KENDARAAN
 -----------------------------
@@ -87,14 +87,8 @@ _SEGMENT_COLORS = [
 ]
 
 def _get_segment_color(segment_index: int, base_color: str) -> str:
-    """
-    Return warna untuk segment ke-N.
-    Jika index < len(_SEGMENT_COLORS): pakai warna dari palette.
-    Jika tidak: fallback ke base_color dengan variasi opacity.
-    """
     if segment_index < len(_SEGMENT_COLORS):
         return _SEGMENT_COLORS[segment_index]
-    # Fallback: variasi dari base_color
     return base_color
 
 
@@ -158,24 +152,18 @@ _REGION_FALLBACK = {
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def _graphhopper_route(coords: Tuple[Tuple[float, float], ...], profile: str = "car") -> Optional[dict]:
-    """
-    Hitung rute menggunakan GraphHopper Directions API v1.
-    coords: tuple of (lat, lng) pairs
-    profile: "motorcycle" atau "car"
-    """
     if len(coords) < 2:
         return None
     
-    # Format point parameter: GraphHopper v1 menerima multiple 'point' params
     points_list = [f"{lat},{lng}" for lat, lng in coords]
     url = f"{_GRAPHHOPPER_BASE}/route"
     
     params = {
         "key": _GRAPHHOPPER_API_KEY,
         "profile": profile,
-        "point": points_list,  # requests akan encode sebagai ?point=A&point=B
+        "point": points_list,
         "instructions": False,
-        "points_encoded": False,  # Dapatkan koordinat mentah (tidak perlu decode polyline)
+        "points_encoded": False,
         "locale": "id",
         "calc_points": True,
     }
@@ -183,7 +171,6 @@ def _graphhopper_route(coords: Tuple[Tuple[float, float], ...], profile: str = "
     try:
         r = requests.get(url, params=params, timeout=20)
         
-        # Handle rate limit
         if r.status_code == 429:
             print(f"[GraphHopper] Rate limited. Waiting...")
             time.sleep(2)
@@ -194,9 +181,8 @@ def _graphhopper_route(coords: Tuple[Tuple[float, float], ...], profile: str = "
             if data.get("paths"):
                 path = data["paths"][0]
                 distance_km = round(path["distance"] / 1000, 2)
-                duration_sec = path["time"] / 1000  # ms → seconds
+                duration_sec = path["time"] / 1000
                 
-                # Koordinat: GraphHopper return [lng, lat], Folium butuh [lat, lng]
                 raw_coords = path.get("points", {}).get("coordinates", [])
                 folium_geom = [[c[1], c[0]] for c in raw_coords] if raw_coords else []
                 
@@ -289,7 +275,6 @@ def _osrm_route(coords: tuple, profile: str = "driving") -> Optional[dict]:
 # ══════════════════════════════════════════════════════════════════
 
 def _safe_delay(min_interval: float = 1.1):
-    """Delay untuk hindari rate limit GraphHopper free tier (1 req/detik)"""
     now = time.time()
     last = st.session_state.get("gh_last_call", 0)
     elapsed = now - last
@@ -299,37 +284,25 @@ def _safe_delay(min_interval: float = 1.1):
 
 
 def _get_route(coords: tuple, vehicle_type: str = "MOBIL") -> dict:
-    """
-    Smart routing dengan priority:
-    1. GraphHopper (motorcycle/car) ← PRIMARY
-    2. ORS (cycling/driving) ← FALLBACK 1
-    3. OSRM (bicycle/driving) ← FALLBACK 2
-    4. Haversine × faktor koreksi ← FALLBACK 3 (last resort)
-    """
-    # Rate limit untuk GraphHopper
     _safe_delay(1.1)
     
     vc = VEHICLE_CONFIG.get(vehicle_type, VEHICLE_CONFIG["MOBIL"])
     gh_profile = vc.get("gh_profile", "car")
     
-    # 1. Coba GraphHopper dulu
     result = _graphhopper_route(coords, gh_profile)
     if result and result.get("geometry"):
         return result
     
-    # 2. Fallback ke ORS
     ors_prof = vc.get("ors_profile", "driving-car")
     result = _ors_route(coords, ors_prof)
     if result and result.get("geometry"):
         return result
     
-    # 3. Fallback ke OSRM
     osrm_prof = vc.get("osrm_profile", "driving")
     result = _osrm_route(coords, osrm_prof)
     if result and result.get("geometry"):
         return result
     
-    # 4. Last resort: estimasi straight line + faktor koreksi
     if len(coords) == 2:
         d = _haversine(coords[0][0], coords[0][1], coords[1][0], coords[1][1])
         factor = 1.15 if vehicle_type == "MOTOR" else 1.25
@@ -519,7 +492,6 @@ def _load_excel(uploaded_file):
 
         r = pd.DataFrame()
         
-        # Kolom identitas order
         r["SO Number"] = df[gc("SO Number", "Invoice NO", "invoice_no")].fillna("-").astype(str) if gc("SO Number", "Invoice NO", "invoice_no") else "-"
         r["Order Date"] = df[gc("Order Date", "order_date")].fillna("-").astype(str) if gc("Order Date", "order_date") else "-"
         r["Channel"] = df[gc("Channel", "channel")].fillna("-").astype(str) if gc("Channel", "channel") else "-"
@@ -544,7 +516,6 @@ def _load_excel(uploaded_file):
         r["Cancelled Reason"] = df[gc("Cancelled Reason", "cancelled_reason")].fillna("-").astype(str) if gc("Cancelled Reason", "cancelled_reason") else "-"
         r["Expiry Date"] = df[gc("Expiry Date", "expiry_date")].fillna("-").astype(str) if gc("Expiry Date", "expiry_date") else "-"
         
-        # Kolom pengiriman & penerima
         r["Shipping Courier"] = df[gc("Shipping Courier", "kurir")].fillna("-").astype(str) if gc("Shipping Courier", "kurir") else "-"
         r["AWB"] = df[gc("AWB", "awb", "resi")].fillna("-").astype(str) if gc("AWB", "awb", "resi") else "-"
         r["Customer Name"] = df[gc("Customer Name", "recipient_name", "penerima")].fillna("-").astype(str) if gc("Customer Name", "recipient_name", "penerima") else "-"
@@ -554,7 +525,6 @@ def _load_excel(uploaded_file):
         r["Additional Info"] = df[gc("Additional Info", "additional_info", "notes")].fillna("-").astype(str) if gc("Additional Info", "additional_info", "notes") else "-"
         r["No Accurate"] = df[gc("No Accurate", "no_accurate")].fillna("-").astype(str) if gc("No Accurate", "no_accurate") else "-"
         
-        # Kolom item & harga
         r["Items SKU"] = df[gc("Items SKU", "items_sku", "sku")].fillna("-").astype(str) if gc("Items SKU", "items_sku", "sku") else "-"
         r["Items Name"] = df[gc("Items Name", "items_name", "nama_barang")].fillna("-").astype(str) if gc("Items Name", "items_name", "nama_barang") else "-"
         r["Warehouse"] = df[gc("Warehouse", "warehouse")].fillna("-").astype(str) if gc("Warehouse", "warehouse") else "-"
@@ -573,7 +543,6 @@ def _load_excel(uploaded_file):
         r["Platform Commission"] = pd.to_numeric(df[gc("Platform Commission Fee", "platform_commission")], errors="coerce").fillna(0) if gc("Platform Commission Fee", "platform_commission") else 0
         r["Total Amount"] = pd.to_numeric(df[gc("Total Amount", "total_amount", "total")], errors="coerce").fillna(0) if gc("Total Amount", "total_amount", "total") else 0
         
-        # Kolom dimensi paket
         def _num(col_name, default=0.0):
             col = gc(col_name, col_name.lower(), col_name.replace(" (cm)", "").replace(" (kg)", ""))
             if col:
@@ -767,14 +736,9 @@ def _compute_route(slat, slng, pkgs, algo="cluster", vehicle_type="MOBIL"):
 # ══════════════════════════════════════════════════════════════════
 
 def _build_single_map(branch, route, vehicle_type, excluded=None):
-    """
-    Membuat peta terpisah untuk satu jenis kendaraan.
-    FITUR BARU: Setiap segmen rute (gudang→1, 1→2, 2→3, dst) punya warna berbeda.
-    """
     vc = VEHICLE_CONFIG[vehicle_type]
     base_color = vc["hex"]
     
-    # Auto bounds untuk zoom
     if route:
         lats = [branch["lat"]] + [p["lat"] for p in route]
         lngs = [branch["lng"]] + [p["lng"] for p in route]
@@ -791,7 +755,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
     if bounds:
         m.fit_bounds(bounds, padding=(20, 20))
 
-    # Marker gudang
     folium.Marker(
         [branch["lat"], branch["lng"]],
         tooltip=f"Gudang {branch['nama']}",
@@ -799,7 +762,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
         icon=folium.Icon(color=_FOLIUM_COLORS.get(branch["kode"], "gray"), icon="home", prefix="fa"),
     ).add_to(m)
 
-    # Lingkaran radius 20 km
     folium.Circle(
         [branch["lat"], branch["lng"]],
         radius=vc["max_radius"] * 1000,
@@ -811,20 +773,16 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
         tooltip=f"Radius operasional: {vc['max_radius']} km"
     ).add_to(m)
 
-    # Gambar rute dengan SEGMENT COLORS
     if route:
         waypoints = [(branch["lat"], branch["lng"])] + [(p["lat"], p["lng"]) for p in route]
         
-        # Gambar setiap segmen dengan warna berbeda
         for seg_idx in range(len(waypoints) - 1):
             start, end = waypoints[seg_idx], waypoints[seg_idx + 1]
             seg = _get_route((start, end), vehicle_type)
             geom = seg["geometry"] if seg.get("geometry") and len(seg["geometry"]) > 1 else [list(start), list(end)]
             
-            # Dapatkan warna untuk segment ini
             seg_color = _get_segment_color(seg_idx, base_color)
             
-            # Tentukan tooltip berdasarkan segment
             if seg_idx == 0:
                 tooltip_text = f"Gudang → Paket #{seg_idx+1}"
             elif seg_idx == len(waypoints) - 2:
@@ -841,8 +799,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
                 popup=f"Segment {seg_idx+1}: {seg.get('distance_km', 0):.2f} km<br>Provider: {seg.get('provider', 'Estimasi')}"
             ).add_to(m)
         
-        # RUTE PULANG: sudah termasuk di loop di atas sebagai segmen terakhir
-        # Tapi kita tambahkan garis putus-putus overlay untuk penekanan visual
         if route:
             last = route[-1]
             return_seg = _get_route(((last["lat"], last["lng"]), (branch["lat"], branch["lng"])), vehicle_type)
@@ -856,7 +812,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
                 tooltip=f"Rute pulang ke gudang"
             ).add_to(m)
         
-        # Marker paket dengan nomor urut
         for idx, pkg in enumerate(route, 1):
             html = (f'<div style="color:white;background:{base_color};border-radius:50%;'
                     f'width:28px;height:28px;display:flex;align-items:center;'
@@ -875,7 +830,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
                           tooltip=f"#{idx} - {pkg.get('Recipient Name','-')[:20]}",
                           icon=folium.DivIcon(html=html, icon_size=(28, 28), icon_anchor=(14, 14))).add_to(m)
 
-    # Marker excluded (diluar radius)
     if excluded:
         for pkg in excluded:
             if pkg.get("lat") and pkg.get("lng"):
@@ -884,7 +838,6 @@ def _build_single_map(branch, route, vehicle_type, excluded=None):
                                     tooltip=f"Diluar radius: {pkg.get('Invoice','-')}",
                                     popup=f"<b>Diluar Jangkauan</b><br>Invoice: {pkg['Invoice']}<br>Jarak: {pkg['Jarak_km']} km").add_to(m)
 
-    # Legend dengan info segment colors
     legend_html = f"""
     <div style="position:fixed;bottom:15px;left:15px;padding:12px 16px;
                 background:white;border:1px solid #ddd;border-radius:8px;
@@ -951,7 +904,8 @@ def _init():
         "selected_branch": _BRANCHES_DEFAULT[0]["kode"],
         "orders_df": None, "pkg_df": None, "hasil": None,
         "filter_kt": True, "algo_mode": "cluster",
-        "gh_last_call": 0,  # Untuk rate limiting GraphHopper
+        "gh_last_call": 0,
+        "is_manual_input": False,  # Added for manual input tracking
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -1023,7 +977,6 @@ with st.sidebar:
         </div>''', unsafe_allow_html=True)
     
     st.divider()
-    # Info GraphHopper
     st.markdown("**Routing Engine**")
     st.caption("Primary: GraphHopper (motorcycle/car) • Fallback: ORS/OSRM")
     
@@ -1045,50 +998,149 @@ st.caption("v18 - GraphHopper API | Segment Colors | Radius 20 km | Peta terpisa
 st.divider()
 
 # ════════════════════════════════════════════════════════════════
-# STEP 1 — UPLOAD FILE
+# STEP 1 — UPLOAD FILE / INPUT MANUAL
 # ════════════════════════════════════════════════════════════════
-st.subheader("Step 1 - Upload File Order")
-st.caption("Upload file order dari marketplace (Excel/CSV). Pastikan kolom 'Shipping Address' tersedia.")
+st.subheader("Step 1 - Input Data Order")
+input_mode = st.radio("Pilih Metode Input", ["Upload File Excel/CSV", "Input Manual Alamat"], horizontal=True)
 
-uploaded = st.file_uploader("Pilih file Excel atau CSV", type=["xlsx", "xls", "csv"], label_visibility="collapsed")
+# Reset state if input mode changes to avoid data mismatch
+if "prev_input_mode" not in st.session_state:
+    st.session_state.prev_input_mode = input_mode
+if st.session_state.prev_input_mode != input_mode:
+    st.session_state.prev_input_mode = input_mode
+    st.session_state.pkg_df = None
+    st.session_state.orders_df = None
+    st.session_state.hasil = None
+    st.session_state.is_manual_input = False
 
-if uploaded:
-    df_orders, msg = _load_excel(uploaded)
-    if df_orders is None:
-        st.error(msg)
-    else:
-        st.session_state.orders_df = df_orders
-        st.success(msg)
-        n_kt = df_orders["Shipping Courier"].apply(_is_kurir_toko).sum()
-        total_val = df_orders["Total Amount"].sum()
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Order", len(df_orders)); c2.metric("Kurir Toko", int(n_kt))
-        c3.metric("Kurir Lain", int(len(df_orders) - n_kt)); c4.metric("Total Nilai", _fmt_rp(total_val))
-        
-        st.session_state.filter_kt = st.toggle("Tampilkan hanya order Kurir Toko", value=st.session_state.filter_kt)
-        df_view = (df_orders[df_orders["Shipping Courier"].apply(_is_kurir_toko)] if st.session_state.filter_kt else df_orders)
-        
-        if df_view.empty:
-            st.warning("Tidak ada order Kurir Toko ditemukan.")
+if input_mode == "Upload File Excel/CSV":
+    st.caption("Upload file order dari marketplace (Excel/CSV). Pastikan kolom 'Shipping Address' tersedia.")
+    uploaded = st.file_uploader("Pilih file Excel atau CSV", type=["xlsx", "xls", "csv"], label_visibility="collapsed")
+
+    if uploaded:
+        df_orders, msg = _load_excel(uploaded)
+        if df_orders is None:
+            st.error(msg)
         else:
-            has_dim = any(df_orders[c].sum() > 0 for c in ["Panjang", "Lebar", "Tinggi", "Berat"])
-            if not has_dim and st.session_state.filter_kt:
-                st.warning("Kolom dimensi kosong. Semua paket akan diklasifikasikan sebagai Motor.")
+            st.session_state.orders_df = df_orders
+            st.success(msg)
+            n_kt = df_orders["Shipping Courier"].apply(_is_kurir_toko).sum()
+            total_val = df_orders["Total Amount"].sum()
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Order", len(df_orders)); c2.metric("Kurir Toko", int(n_kt))
+            c3.metric("Kurir Lain", int(len(df_orders) - n_kt)); c4.metric("Total Nilai", _fmt_rp(total_val))
             
-            cols_show = {"SO Number": "SO No", "Invoice NO": "Invoice", "Order Date": "Tgl Order", 
-                        "Recipient Name": "Penerima", "Items Name": "Barang", "Items Quantity": "Qty",
-                        "Panjang": "P(cm)", "Lebar": "L(cm)", "Tinggi": "T(cm)", "Berat": "W(kg)",
-                        "Kendaraan_Override": "Override", "Total Amount": "Total", 
-                        "Shipping Address": "Alamat", "Shipping Courier": "Kurir"}
-            avail = [c for c in cols_show if c in df_view.columns]
-            df_disp = df_view[avail].copy().rename(columns=cols_show)
-            st.markdown(f"#### Preview Data ({len(df_view)} baris)")
-            st.dataframe(df_disp, use_container_width=True, height=260, hide_index=True)
+            st.session_state.filter_kt = st.toggle("Tampilkan hanya order Kurir Toko", value=st.session_state.filter_kt)
+            df_view = (df_orders[df_orders["Shipping Courier"].apply(_is_kurir_toko)] if st.session_state.filter_kt else df_orders)
             
-            if st.button(f"Gunakan {len(df_view)} Order Ini", type="primary", use_container_width=True):
-                st.session_state.pkg_df = df_view.reset_index(drop=True)
+            if df_view.empty:
+                st.warning("Tidak ada order Kurir Toko ditemukan.")
+            else:
+                has_dim = any(df_orders[c].sum() > 0 for c in ["Panjang", "Lebar", "Tinggi", "Berat"])
+                if not has_dim and st.session_state.filter_kt:
+                    st.warning("Kolom dimensi kosong. Semua paket akan diklasifikasikan sebagai Motor.")
+                
+                cols_show = {"SO Number": "SO No", "Invoice NO": "Invoice", "Order Date": "Tgl Order", 
+                            "Recipient Name": "Penerima", "Items Name": "Barang", "Items Quantity": "Qty",
+                            "Panjang": "P(cm)", "Lebar": "L(cm)", "Tinggi": "T(cm)", "Berat": "W(kg)",
+                            "Kendaraan_Override": "Override", "Total Amount": "Total", 
+                            "Shipping Address": "Alamat", "Shipping Courier": "Kurir"}
+                avail = [c for c in cols_show if c in df_view.columns]
+                df_disp = df_view[avail].copy().rename(columns=cols_show)
+                st.markdown(f"#### Preview Data ({len(df_view)} baris)")
+                st.dataframe(df_disp, use_container_width=True, height=260, hide_index=True)
+                
+                if st.button(f"Gunakan {len(df_view)} Order Ini", type="primary", use_container_width=True):
+                    st.session_state.pkg_df = df_view.reset_index(drop=True)
+                    st.session_state.hasil = None
+                    st.success("Order siap. Lanjut ke Step 2 untuk hitung rute.")
+else:
+    st.caption("Masukkan alamat tujuan pengiriman secara manual untuk simulasi / testing. Gudang dan rute pulang akan mengikuti pilihan di sidebar.")
+    
+    if st.session_state.get("is_manual_input") and st.session_state.pkg_df is not None:
+        df_view = st.session_state.pkg_df
+        st.success(f"Data manual aktif: {len(df_view)} alamat siap diproses.")
+        
+        cols_show = {"SO Number": "SO No", "Invoice NO": "Invoice", "Order Date": "Tgl Order", 
+                    "Recipient Name": "Penerima", "Items Name": "Barang", "Items Quantity": "Qty",
+                    "Panjang": "P(cm)", "Lebar": "L(cm)", "Tinggi": "T(cm)", "Berat": "W(kg)",
+                    "Kendaraan_Override": "Override", "Total Amount": "Total", 
+                    "Shipping Address": "Alamat", "Shipping Courier": "Kurir"}
+        avail = [c for c in cols_show if c in df_view.columns]
+        df_disp = df_view[avail].copy().rename(columns=cols_show)
+        st.markdown(f"#### Preview Data Manual ({len(df_view)} baris)")
+        st.dataframe(df_disp, use_container_width=True, height=260, hide_index=True)
+        
+        if st.button("Reset & Input Ulang", use_container_width=True):
+            st.session_state.is_manual_input = False
+            st.session_state.pkg_df = None
+            st.session_state.orders_df = None
+            st.session_state.hasil = None
+            st.rerun()
+            
+    else:
+        num_addr = st.number_input("Jumlah alamat yang ingin diinput", min_value=1, max_value=15, value=2, step=1)
+        
+        manual_data = []
+        for i in range(int(num_addr)):
+            with st.expander(f"📍 Alamat {i+1}", expanded=(i==0)):
+                c1, c2 = st.columns([2, 1])
+                with c1:
+                    addr = st.text_input(f"Alamat Lengkap", key=f"addr_{i}", placeholder="Jl. Sudirman No. 1, Surabaya")
+                with c2:
+                    recipient = st.text_input(f"Nama Penerima", value=f"Penerima {i+1}", key=f"rec_{i}")
+                    
+                c3, c4, c5 = st.columns(3)
+                with c3:
+                    item_name = st.text_input(f"Nama Barang", value=f"Paket {i+1}", key=f"item_{i}")
+                with c4:
+                    qty = st.number_input(f"Qty", min_value=1, value=1, step=1, key=f"qty_{i}")
+                with c5:
+                    vehicle_override = st.selectbox(f"Override Kendaraan", ["", "MOTOR", "MOBIL"], key=f"veh_{i}")
+                    
+                with st.expander(f"Detail Dimensi & Berat (Opsional)"):
+                    c6, c7, c8, c9 = st.columns(4)
+                    with c6: panjang = st.number_input(f"P (cm)", min_value=0, value=0, key=f"p_{i}")
+                    with c7: lebar = st.number_input(f"L (cm)", min_value=0, value=0, key=f"l_{i}")
+                    with c8: tinggi = st.number_input(f"T (cm)", min_value=0, value=0, key=f"t_{i}")
+                    with c9: berat = st.number_input(f"Berat (kg)", min_value=0.0, value=0.0, step=0.1, key=f"w_{i}")
+                
+                if addr.strip():
+                    manual_data.append({
+                        "SO Number": f"MAN-{i+1:03d}", "Order Date": pd.Timestamp.now().strftime("%Y-%m-%d"),
+                        "Channel": "Manual", "Store": "Manual", "Invoice NO": f"INV-MAN-{i+1:03d}",
+                        "Payment Status": "Paid", "Fulfillment Status": "Ready", "Payment Type": "Manual",
+                        "Payment Date": "-", "Printed Date": "-", "Ready to Pack Date": "-",
+                        "Ready to Ship Date": "-", "Marketplace RTS Date": "-", "Handover Date": "-",
+                        "Shipped Date": "-", "Delivered Date": "-", "Completed Date": "-",
+                        "Cancelled Date": "-", "Return Date": "-", "Unpacking Date": "-",
+                        "Delete Nota Date": "-", "Cancelled Reason": "-", "Expiry Date": "-",
+                        "Shipping Courier": "Kurir Toko", 
+                        "AWB": f"AWB-MAN-{i+1:03d}",
+                        "Customer Name": recipient, "Recipient Name": recipient, "Recipient Phone": "-",
+                        "Shipping Address": addr, "Additional Info": "-", "No Accurate": "-",
+                        "Items SKU": f"SKU-MAN-{i+1:03d}", "Items Name": item_name,
+                        "Warehouse": cab["nama"], "Warehouse Code": cab["kode"],
+                        "Items Quantity": qty, "Items Price": 0, "Items Discount Price": 0, "Subtotal": 0,
+                        "Original Shipping": 0, "Buyer Paid Shipping": 0, "Shipping Rebate": 0,
+                        "Seller Discount": 0, "Rebate": 0, "Voucher Seller": 0,
+                        "Platform Service Fee": 0, "Platform Commission": 0, "Total Amount": 0,
+                        "Panjang": panjang, "Lebar": lebar, "Tinggi": tinggi, "Berat": berat,
+                        "Kendaraan_Override": vehicle_override,
+                    })
+                    
+        if st.button("Gunakan Data Manual Ini", type="primary", use_container_width=True):
+            if not manual_data:
+                st.warning("Harap isi minimal satu alamat lengkap.")
+            else:
+                df_manual = pd.DataFrame(manual_data)
+                st.session_state.orders_df = df_manual
+                st.session_state.pkg_df = df_manual
+                st.session_state.is_manual_input = True
                 st.session_state.hasil = None
-                st.success("Order siap. Lanjut ke Step 2 untuk hitung rute.")
+                st.success(f"Berhasil memuat {len(df_manual)} order manual.")
+                st.rerun()
+
 st.divider()
 
 # ════════════════════════════════════════════════════════════════
@@ -1096,7 +1148,7 @@ st.divider()
 # ════════════════════════════════════════════════════════════════
 st.subheader("Step 2 - Hitung Rute Optimal")
 if st.session_state.pkg_df is None:
-    st.info("Upload dan pilih order terlebih dahulu di Step 1.")
+    st.info("Upload atau input alamat terlebih dahulu di Step 1.")
 else:
     n_order = len(st.session_state.pkg_df)
     algo_label = "Cluster + NN" if st.session_state.algo_mode == "cluster" else "Nearest Neighbor"
@@ -1132,7 +1184,6 @@ else:
         if not paket_ok:
             st.error("Semua alamat gagal diproses. Periksa koneksi atau format alamat."); st.stop()
         
-        # Klasifikasi & split
         motor_pkgs, mobil_pkgs, excluded = _split_by_vehicle(paket_ok, cab["lat"], cab["lng"])
         st.info(f"Klasifikasi: {len(motor_pkgs)} paket Motor | {len(mobil_pkgs)} paket Mobil | {len(excluded)} diluar radius 20 km")
         
@@ -1149,13 +1200,11 @@ else:
         if not motor_pkgs and not mobil_pkgs:
             st.error("Semua paket di luar jangkauan. Periksa koordinat gudang."); st.stop()
         
-        # Hitung rute
         with st.spinner("Menghitung rute Motor..."):
             r_motor, km_motor, _, sec_motor = _compute_route(cab["lat"], cab["lng"], motor_pkgs, st.session_state.algo_mode, "MOTOR")
         with st.spinner("Menghitung rute Mobil..."):
             r_mobil, km_mobil, _, sec_mobil = _compute_route(cab["lat"], cab["lng"], mobil_pkgs, st.session_state.algo_mode, "MOBIL")
         
-        # Jarak pulang
         def _pulang(route, vtype):
             if not route: return 0, 0
             last = route[-1]
@@ -1189,7 +1238,6 @@ if st.session_state.hasil:
     
     st.divider(); st.subheader("Step 3 - Hasil & Peta Rute")
     
-    # Ringkasan
     col1, col2 = st.columns(2)
     with col1:
         st.markdown(f"##### Rute Motor")
@@ -1213,7 +1261,6 @@ if st.session_state.hasil:
     
     st.divider()
     
-    # Total
     cs1, cs2, cs3, cs4 = st.columns(4)
     cs1.metric("Total Paket", len(hasil["route_motor"]) + len(hasil["route_mobil"]))
     cs2.metric("Total Jarak", f"{hasil['km_motor_full'] + hasil['km_mobil_full']:.1f} km")
@@ -1222,7 +1269,6 @@ if st.session_state.hasil:
     
     st.divider()
     
-    # Tabs: Urutan Motor | Urutan Mobil | Peta Motor | Peta Mobil | Export
     tab_order_motor, tab_order_mobil, tab_map_motor, tab_map_mobil, tab_export = st.tabs([
         "Urutan Motor", "Urutan Mobil", "Peta Motor", "Peta Mobil", "Export Data"
     ])
